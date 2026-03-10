@@ -1,17 +1,19 @@
 """
-Telegram-бот для групповых чатов с SQLite + AI-генерация через OpenRouter.
+Telegram-бот для групповых чатов с SQLite хранилищем.
+Триггеры настраиваются отдельно для каждой группы через команды.
 
-Два режима ответов на триггеры:
-  - classic : стандартные ответы из базы
-  - ai      : GPT-4o-mini генерирует смешной ответ на основе триггера
+Три режима срабатывания:
+  - any    : триггер найден в любом месте сообщения
+  - end    : триггер — последнее слово(а) сообщения
+  - exact  : сообщение состоит ТОЛЬКО из триггера
 
 Установка:
-    pip install python-telegram-bot==20.7 httpx==0.27.0
+    pip install python-telegram-bot==20.7
 
 Запуск:
     1. Получи токен у @BotFather
-    2. Получи API-ключ на https://openrouter.ai/keys
-    3. Заполни .env (BOT_TOKEN, OPENROUTER_API_KEY)
+    2. Заполни .env (BOT_TOKEN)
+    3. У @BotFather: Group Privacy → Turn off
     4. python trigger_bot.py
 
 Команды:
@@ -20,8 +22,7 @@ Telegram-бот для групповых чатов с SQLite + AI-генера
     /del триггер               — удалить триггер
     /list                      — список триггеров группы
     /clear                     — удалить ВСЕ триггеры (только админы)
-    /mode                      — переключить режим (classic ↔ ai)
-    /temp 0.0-2.0              — установить температуру AI
+    /mode                      — переключить режим (any → end → exact)
     /help                      — справка
 """
 
@@ -29,8 +30,6 @@ import os
 import sqlite3
 import logging
 from pathlib import Path
-
-import httpx
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -43,23 +42,15 @@ from telegram.ext import (
 # ─── Настройки ───────────────────────────────────────────────────────────────
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
 DB_PATH = Path(os.getenv("DB_PATH", Path(__file__).parent / "triggers.db"))
 
-# Системный промпт для AI-режима
-AI_SYSTEM_PROMPT = (
-    "Ты — бот-тролль в русскоязычном групповом чате. "
-    "Тебе дают слово-триггер и стандартный ответ на него. "
-    "Твоя задача — придумать СМЕШНОЙ, дерзкий, остроумный вариант ответа. "
-    "Используй сленг, мемы, абсурдный юмор. "
-    "Ответ должен быть КОРОТКИМ — максимум 1-2 предложения. "
-    "Не объясняй шутку. Не извиняйся. Просто будь смешным."
-)
+MODES = ["any", "end", "exact"]
+MODE_LABELS = {
+    "any":   "🔍 any — триггер в любом месте сообщения",
+    "end":   "⬇️ end — триггер в конце сообщения",
+    "exact": "🎯 exact — сообщение = только триггер",
+}
 
-# Дефолтные пары
 DEFAULT_PAIRS = [
     ("да",       "пизда",                True),
     ("нет",      "пидора ответ",         True),
@@ -77,47 +68,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-# ─── HTTP-клиент для OpenRouter ──────────────────────────────────────────────
-
-http_client = httpx.AsyncClient(timeout=15.0)
-
-
-async def ai_generate(trigger: str, classic_response: str, temperature: float) -> str | None:
-    """Генерирует смешной ответ через OpenRouter."""
-    if not OPENROUTER_API_KEY:
-        return None
-
-    user_prompt = (
-        f"Триггерное слово: «{trigger}»\n"
-        f"Классический ответ: «{classic_response}»\n"
-        f"Придумай смешную альтернативу:"
-    )
-
-    try:
-        resp = await http_client.post(
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": OPENROUTER_MODEL,
-                "temperature": temperature,
-                "max_tokens": 150,
-                "messages": [
-                    {"role": "system", "content": AI_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.error(f"OpenRouter error: {e}")
-        return None
-
 
 # ─── База данных ─────────────────────────────────────────────────────────────
 
@@ -146,9 +96,8 @@ def get_db() -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS chat_settings (
-            chat_id     INTEGER PRIMARY KEY,
-            mode        TEXT    NOT NULL DEFAULT 'classic',
-            temperature REAL   NOT NULL DEFAULT 1.0
+            chat_id INTEGER PRIMARY KEY,
+            mode    TEXT NOT NULL DEFAULT 'any'
         )
         """
     )
@@ -159,16 +108,13 @@ def get_db() -> sqlite3.Connection:
 # ─── Настройки чата ──────────────────────────────────────────────────────────
 
 
-def get_chat_settings(chat_id: int) -> dict:
+def get_chat_mode(chat_id: int) -> str:
     conn = get_db()
     row = conn.execute(
-        "SELECT mode, temperature FROM chat_settings WHERE chat_id = ?",
-        (chat_id,),
+        "SELECT mode FROM chat_settings WHERE chat_id = ?", (chat_id,)
     ).fetchone()
     conn.close()
-    if row:
-        return {"mode": row[0], "temperature": row[1]}
-    return {"mode": "classic", "temperature": 1.0}
+    return row[0] if row else "any"
 
 
 def set_chat_mode(chat_id: int, mode: str) -> None:
@@ -177,17 +123,6 @@ def set_chat_mode(chat_id: int, mode: str) -> None:
         "INSERT INTO chat_settings (chat_id, mode) VALUES (?, ?) "
         "ON CONFLICT(chat_id) DO UPDATE SET mode = excluded.mode",
         (chat_id, mode),
-    )
-    conn.commit()
-    conn.close()
-
-
-def set_chat_temperature(chat_id: int, temp: float) -> None:
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO chat_settings (chat_id, temperature) VALUES (?, ?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET temperature = excluded.temperature",
-        (chat_id, temp),
     )
     conn.commit()
     conn.close()
@@ -283,25 +218,39 @@ def clear_triggers(chat_id: int) -> int:
     return deleted
 
 
-# ─── Поиск триггера ─────────────────────────────────────────────────────────
+# ─── Поиск триггера с учётом режима ─────────────────────────────────────────
 
 
-def find_trigger(chat_id: int, text: str) -> tuple[str, str] | None:
-    """Возвращает (trigger_word, response) или None."""
+def find_trigger(chat_id: int, text: str, mode: str) -> str | None:
     triggers = get_triggers(chat_id)
     text_lower = text.lower().strip()
     words = text_lower.split()
 
+    # Сортируем по длине (сначала многословные)
     triggers_sorted = sorted(triggers, key=lambda t: len(t[0].split()), reverse=True)
 
     for key, response, _ in triggers_sorted:
         key_words = key.split()
         key_len = len(key_words)
-        if text_lower == key:
-            return (key, response)
-        for i in range(len(words) - key_len + 1):
-            if words[i : i + key_len] == key_words:
-                return (key, response)
+
+        if mode == "exact":
+            # Сообщение целиком = триггер
+            if text_lower == key:
+                return response
+
+        elif mode == "end":
+            # Триггер — последние слова сообщения
+            if len(words) >= key_len and words[-key_len:] == key_words:
+                return response
+
+        else:  # any
+            # Точное совпадение
+            if text_lower == key:
+                return response
+            # Вхождение как подпоследовательность слов
+            for i in range(len(words) - key_len + 1):
+                if words[i : i + key_len] == key_words:
+                    return response
 
     return None
 
@@ -324,11 +273,8 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = get_chat_settings(update.effective_chat.id)
-    mode_icon = "🤖" if settings["mode"] == "ai" else "📝"
-    ai_status = ""
-    if not OPENROUTER_API_KEY:
-        ai_status = "\n\n⚠️ <i>OPENROUTER_API_KEY не задан — AI-режим недоступен</i>"
+    chat_id = update.effective_chat.id
+    mode = get_chat_mode(chat_id)
 
     text = (
         "🤖 <b>Триггер-бот — справка</b>\n\n"
@@ -338,69 +284,52 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<code>/del триггер</code> — удалить\n"
         "<code>/list</code> — список триггеров\n"
         "<code>/clear</code> — удалить всё (админы)\n\n"
-        "<b>AI-режим:</b>\n"
-        "<code>/mode</code> — переключить classic ↔ ai\n"
-        "<code>/temp 0.0-2.0</code> — температура генерации\n\n"
-        f"Текущий режим: {mode_icon} <b>{settings['mode']}</b> "
-        f"(temp: {settings['temperature']})"
-        f"{ai_status}"
+        "<b>Режим срабатывания:</b>\n"
+        "<code>/mode</code> — переключить режим\n"
+        "<code>/mode any|end|exact</code> — задать напрямую\n\n"
+        "🔍 <b>any</b> — триггер в любом месте\n"
+        "  <i>«я сказал да вчера» → пизда</i>\n"
+        "⬇️ <b>end</b> — триггер в конце\n"
+        "  <i>«ну вот да» → пизда</i>\n"
+        "  <i>«да конечно» → ✗ не сработает</i>\n"
+        "🎯 <b>exact</b> — сообщение = только триггер\n"
+        "  <i>«да» → пизда</i>\n"
+        "  <i>«ну да» → ✗ не сработает</i>\n\n"
+        f"Текущий режим: <b>{MODE_LABELS[mode]}</b>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    settings = get_chat_settings(chat_id)
-
-    if settings["mode"] == "classic":
-        if not OPENROUTER_API_KEY:
-            await update.message.reply_text(
-                "⚠️ AI-режим недоступен: OPENROUTER_API_KEY не задан."
-            )
-            return
-        set_chat_mode(chat_id, "ai")
-        await update.message.reply_text(
-            "🤖 Режим переключён на <b>AI</b>\n"
-            "Теперь ответы генерирует GPT-4o-mini!",
-            parse_mode="HTML",
-        )
-    else:
-        set_chat_mode(chat_id, "classic")
-        await update.message.reply_text(
-            "📝 Режим переключён на <b>classic</b>\n"
-            "Стандартные ответы из базы.",
-            parse_mode="HTML",
-        )
-
-
-async def cmd_temp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
     raw = update.message.text.split(maxsplit=1)
 
-    if len(raw) < 2:
-        settings = get_chat_settings(chat_id)
-        await update.message.reply_text(
-            f"Текущая температура: <b>{settings['temperature']}</b>\n"
-            f"Формат: <code>/temp 0.0-2.0</code>\n\n"
-            f"🧊 0.0 = предсказуемо\n"
-            f"🔥 2.0 = полный хаос",
-            parse_mode="HTML",
-        )
-        return
+    if len(raw) >= 2:
+        requested = raw[1].strip().lower()
+        if requested in MODES:
+            set_chat_mode(chat_id, requested)
+            await update.message.reply_text(
+                f"✅ Режим: <b>{MODE_LABELS[requested]}</b>",
+                parse_mode="HTML",
+            )
+            return
+        else:
+            await update.message.reply_text(
+                f"Неизвестный режим. Доступные: <code>any</code>, "
+                f"<code>end</code>, <code>exact</code>",
+                parse_mode="HTML",
+            )
+            return
 
-    try:
-        temp = float(raw[1].replace(",", "."))
-        if not 0.0 <= temp <= 2.0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Температура должна быть числом от 0.0 до 2.0")
-        return
+    # Циклическое переключение: any → end → exact → any
+    current = get_chat_mode(chat_id)
+    idx = MODES.index(current)
+    new_mode = MODES[(idx + 1) % len(MODES)]
+    set_chat_mode(chat_id, new_mode)
 
-    set_chat_temperature(chat_id, temp)
-    icons = {0: "🧊", 1: "🌡", 2: "🔥"}
-    icon = icons.get(int(temp), "🌡")
     await update.message.reply_text(
-        f"{icon} Температура установлена: <b>{temp}</b>", parse_mode="HTML"
+        f"✅ Режим: <b>{MODE_LABELS[new_mode]}</b>",
+        parse_mode="HTML",
     )
 
 
@@ -483,9 +412,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         arrow = "↔️" if bidirect else "➡️"
         lines.append(f"  {arrow} <b>{trigger_w}</b> → {response}")
 
-    settings = get_chat_settings(chat_id)
-    mode_icon = "🤖" if settings["mode"] == "ai" else "📝"
-    header = f"📋 <b>Триггеры ({len(lines)})</b> | режим: {mode_icon} {settings['mode']}\n"
+    mode = get_chat_mode(chat_id)
+    header = f"📋 <b>Триггеры ({len(lines)})</b> | {MODE_LABELS[mode]}\n"
     await update.message.reply_text(header + "\n".join(lines), parse_mode="HTML")
 
 
@@ -511,23 +439,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     ensure_defaults(chat_id)
 
-    result = find_trigger(chat_id, update.message.text)
-    if not result:
-        return
-
-    trigger_word, classic_response = result
-    settings = get_chat_settings(chat_id)
-
-    if settings["mode"] == "ai" and OPENROUTER_API_KEY:
-        ai_response = await ai_generate(
-            trigger_word, classic_response, settings["temperature"]
-        )
-        if ai_response:
-            await update.message.reply_text(ai_response)
-            return
-        # Fallback на классику если AI не ответил
-
-    await update.message.reply_text(classic_response)
+    mode = get_chat_mode(chat_id)
+    response = find_trigger(chat_id, update.message.text, mode)
+    if response:
+        await update.message.reply_text(response)
 
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
@@ -541,8 +456,6 @@ def main() -> None:
 
     get_db().close()
     logger.info(f"База данных: {DB_PATH}")
-    logger.info(f"Модель: {OPENROUTER_MODEL}")
-    logger.info(f"OpenRouter: {'✅ ключ задан' if OPENROUTER_API_KEY else '❌ ключ не задан'}")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -554,7 +467,6 @@ def main() -> None:
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("mode", cmd_mode))
-    app.add_handler(CommandHandler("temp", cmd_temp))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Бот запущен!")
