@@ -1,0 +1,11 @@
+services:
+  trigger-bot:
+    build: .
+    container_name: trigger-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - bot-data:/app/data
+
+volumes:
+  bot-data:
